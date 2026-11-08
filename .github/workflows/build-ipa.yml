@@ -72,17 +72,19 @@ jobs:
             spm-${{ env.SWIFTFIN_TAG }}-
             spm-
 
-      - name: 探测 scheme
+      - name: 选择 scheme（纯读文件，绝不触发依赖解析）
         id: scheme
         run: |
           cd work/Swiftfin
-          SCHEMES=$(xcodebuild -list -project Swiftfin.xcodeproj -json 2>/dev/null \
-            | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)['project']['schemes']))" \
-            || true)
-          echo "全部 scheme："; echo "$SCHEMES"
-          PICK=$(echo "$SCHEMES" | grep -i swiftfin | grep -vi tv | head -1)
-          [ -z "$PICK" ] && PICK="Swiftfin"
-          echo "选用：$PICK"
+          XC="Swiftfin.xcodeproj/xcshareddata/xcschemes"
+          echo "scheme 文件："
+          ls "$XC" 2>/dev/null || echo "（没有 xcshareddata/xcschemes 目录）"
+          PICK=$(ls "$XC"/*.xcscheme 2>/dev/null \
+            | xargs -n1 basename 2>/dev/null \
+            | sed 's/\.xcscheme$//' \
+            | grep -i swiftfin | grep -vi tv | head -1)
+          if [ -z "$PICK" ]; then PICK="Swiftfin"; fi
+          echo "选用 scheme：$PICK"
           echo "name=$PICK" >> "$GITHUB_OUTPUT"
 
       - name: 解析 SwiftPM 依赖
