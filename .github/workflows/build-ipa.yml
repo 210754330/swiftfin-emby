@@ -89,13 +89,29 @@ jobs:
       - name: 解析 SwiftPM 依赖
         run: |
           cd work/Swiftfin
-          xcodebuild -project Swiftfin.xcodeproj \
+          set +e
+          timeout 1500 xcodebuild -project Swiftfin.xcodeproj \
             -scheme "${{ steps.scheme.outputs.name }}" \
             -resolvePackageDependencies \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
             -clonedSourcePackagesDirPath "$(pwd)/../spm" \
-            | tail -30
-          echo "checkouts："
+            -quiet 2>&1
+          RC=$?
+          echo "resolve 退出码：$RC"
+          echo "--- checkouts ---"
           ls ../spm/checkouts 2>/dev/null || true
+          du -sh ../spm 2>/dev/null || true
+          if [ $RC -ne 0 ]; then
+            echo "解析失败，用普通模式再试一次"
+            timeout 1500 xcodebuild -project Swiftfin.xcodeproj \
+              -scheme "${{ steps.scheme.outputs.name }}" \
+              -resolvePackageDependencies \
+              -skipMacroValidation \
+              -skipPackagePluginValidation \
+              -clonedSourcePackagesDirPath "$(pwd)/../spm" 2>&1 | tail -60
+            echo "二次退出码：$?"
+          fi
 
       - name: 给 SDK 打 Emby 认证头补丁
         run: |
@@ -116,7 +132,7 @@ jobs:
             "$(pwd)/../spm/checkouts/jellyfin-sdk-swift" || true
 
           set -o pipefail
-          xcodebuild \
+          timeout 2700 xcodebuild \
             -project Swiftfin.xcodeproj \
             -scheme "${{ steps.scheme.outputs.name }}" \
             -configuration Release \
@@ -124,6 +140,8 @@ jobs:
             -archivePath "$(pwd)/../build/Swiftfin.xcarchive" \
             -clonedSourcePackagesDirPath "$(pwd)/../spm" \
             -derivedDataPath "$(pwd)/../dd" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
             CODE_SIGNING_REQUIRED=NO \
             CODE_SIGN_IDENTITY="" \
@@ -131,7 +149,7 @@ jobs:
             PROVISIONING_PROFILE_SPECIFIER="" \
             DEVELOPMENT_TEAM="" \
             archive \
-            2>&1 | tee ../build.log | tail -80
+            2>&1 | tee ../build.log | tail -100
 
       - name: 打包 .ipa
         run: |
