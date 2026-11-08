@@ -1,0 +1,177 @@
+name: Build Emby IPA
+
+# ============================================================================
+# 在 GitHub 的 macOS 机器上编译 Swiftfin + Emby 补丁，产出未签名 .ipa
+# 下载后用全能签 / Sideloadly / AltStore 自己签名安装
+#
+# 触发方式：
+#   1. 仓库页面 → Actions → Build Emby IPA → Run workflow
+#   2. 或者往 main 分支 push 一次
+# 首次编译约 25~40 分钟（SPM 拉 VLCKit 很慢），第二次有缓存约 10 分钟
+# ============================================================================
+
+on:
+  workflow_dispatch:
+    inputs:
+      swiftfin_tag:
+        description: 'Swiftfin 版本。1.6.1 需 iOS 18+，1.1.1 需 iOS 16+'
+        required: true
+        default: '1.6.1'
+        type: choice
+        options:
+          - '1.6.1'
+          - '1.5'
+          - '1.4'
+          - '1.3'
+          - '1.2'
+          - '1.1.1'
+  push:
+    branches: [main]
+
+env:
+  SWIFTFIN_TAG: ${{ github.event.inputs.swiftfin_tag || '1.6.1' }}
+  APP_NAME: SwiftfinEmby
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: 选择 Xcode
+        run: |
+          echo "可用 Xcode："
+          ls -d /Applications/Xcode*.app 2>/dev/null || true
+          sudo xcode-select -s /Applications/Xcode.app 2>/dev/null \
+            || sudo xcode-select -s "$(ls -d /Applications/Xcode*.app | sort -V | tail -1)"
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+
+      - name: 拉取 Swiftfin 源码
+        run: |
+          mkdir -p work
+          git clone --depth 1 --branch "$SWIFTFIN_TAG" \
+            https://github.com/jellyfin/Swiftfin.git work/Swiftfin
+          cd work/Swiftfin
+          echo "commit: $(git rev-parse --short HEAD)"
+          grep -oE 'IPHONEOS_DEPLOYMENT_TARGET = [0-9.]+' \
+            Swiftfin.xcodeproj/project.pbxproj | sort -u || true
+
+      - name: 给 Swiftfin 打 Emby 补丁
+        run: python3 scripts/patch_swiftfin.py work/Swiftfin
+
+      - name: 缓存 SwiftPM
+        uses: actions/cache@v4
+        with:
+          path: work/spm
+          key: spm-${{ env.SWIFTFIN_TAG }}-${{ github.run_id }}
+          restore-keys: |
+            spm-${{ env.SWIFTFIN_TAG }}-
+            spm-
+
+      - name: 探测 scheme
+        id: scheme
+        run: |
+          cd work/Swiftfin
+          SCHEMES=$(xcodebuild -list -project Swiftfin.xcodeproj -json 2>/dev/null \
+            | python3 -c "import sys,json; print('\n'.join(json.load(sys.stdin)['project']['schemes']))" \
+            || true)
+          echo "全部 scheme："; echo "$SCHEMES"
+          PICK=$(echo "$SCHEMES" | grep -i swiftfin | grep -vi tv | head -1)
+          [ -z "$PICK" ] && PICK="Swiftfin"
+          echo "选用：$PICK"
+          echo "name=$PICK" >> "$GITHUB_OUTPUT"
+
+      - name: 解析 SwiftPM 依赖
+        run: |
+          cd work/Swiftfin
+          xcodebuild -project Swiftfin.xcodeproj \
+            -scheme "${{ steps.scheme.outputs.name }}" \
+            -resolvePackageDependencies \
+            -clonedSourcePackagesDirPath "$(pwd)/../spm" \
+            | tail -30
+          echo "checkouts："
+          ls ../spm/checkouts 2>/dev/null || true
+
+      - name: 给 SDK 打 Emby 认证头补丁
+        run: |
+          SDK_DIR="work/spm/checkouts/jellyfin-sdk-swift"
+          if [ ! -d "$SDK_DIR" ]; then
+            echo "找不到 $SDK_DIR"
+            ls work/spm/checkouts || true
+            exit 1
+          fi
+          python3 scripts/patch_sdk.py "$SDK_DIR"
+          grep -n "X-Emby" "$SDK_DIR/Sources/PassthroughAPIClientDelegate.swift"
+
+      - name: 编译（未签名 archive）
+        run: |
+          cd work/Swiftfin
+          # 保险：上面解析依赖时如果被还原，再补一次
+          python3 "$GITHUB_WORKSPACE/scripts/patch_sdk.py" \
+            "$(pwd)/../spm/checkouts/jellyfin-sdk-swift" || true
+
+          set -o pipefail
+          xcodebuild \
+            -project Swiftfin.xcodeproj \
+            -scheme "${{ steps.scheme.outputs.name }}" \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath "$(pwd)/../build/Swiftfin.xcarchive" \
+            -clonedSourcePackagesDirPath "$(pwd)/../spm" \
+            -derivedDataPath "$(pwd)/../dd" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            DEVELOPMENT_TEAM="" \
+            archive \
+            2>&1 | tee ../build.log | tail -80
+
+      - name: 打包 .ipa
+        run: |
+          ARCHIVE="work/build/Swiftfin.xcarchive"
+          if [ ! -d "$ARCHIVE" ]; then
+            echo "没有产出 archive，构建失败"
+            tail -120 work/build.log || true
+            exit 1
+          fi
+
+          APP=$(find "$ARCHIVE/Products/Applications" -maxdepth 1 -name '*.app' | head -1)
+          echo "App: $APP"
+          /usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$APP/Info.plist" || true
+          /usr/libexec/PlistBuddy -c "Print :MinimumOSVersion" "$APP/Info.plist" || true
+
+          rm -rf out && mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          cp "$APP/Info.plist" out/Info.plist.bak
+
+          # 改个名字，装到手机上不会和正版 Swiftfin 混淆
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Swiftfin Emby" \
+            "out/Payload/$(basename "$APP")/Info.plist" 2>/dev/null || true
+
+          cd out
+          zip -qry "../${APP_NAME}-unsigned.ipa" Payload
+          cd ..
+          ls -lh "${APP_NAME}-unsigned.ipa"
+          unzip -l "${APP_NAME}-unsigned.ipa" | head -12
+
+      - name: 上传 ipa
+        uses: actions/upload-artifact@v4
+        with:
+          name: Swiftfin-Emby-ipa-${{ env.SWIFTFIN_TAG }}
+          path: SwiftfinEmby-unsigned.ipa
+          retention-days: 30
+
+      - name: 失败时保留日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ env.SWIFTFIN_TAG }}
+          path: work/build.log
+          retention-days: 7
+          if-no-files-found: ignore
