@@ -90,7 +90,7 @@ jobs:
         run: |
           cd work/Swiftfin
           set +e
-          timeout 1500 xcodebuild -project Swiftfin.xcodeproj \
+          xcodebuild -project Swiftfin.xcodeproj \
             -scheme "${{ steps.scheme.outputs.name }}" \
             -resolvePackageDependencies \
             -skipMacroValidation \
@@ -102,16 +102,23 @@ jobs:
           echo "--- checkouts ---"
           ls ../spm/checkouts 2>/dev/null || true
           du -sh ../spm 2>/dev/null || true
-          if [ $RC -ne 0 ]; then
-            echo "解析失败，用普通模式再试一次"
-            timeout 1500 xcodebuild -project Swiftfin.xcodeproj \
+
+          if [ ! -d ../spm/checkouts/jellyfin-sdk-swift ]; then
+            echo "首次没下全，普通模式重试"
+            xcodebuild -project Swiftfin.xcodeproj \
               -scheme "${{ steps.scheme.outputs.name }}" \
               -resolvePackageDependencies \
               -skipMacroValidation \
               -skipPackagePluginValidation \
-              -clonedSourcePackagesDirPath "$(pwd)/../spm" 2>&1 | tail -60
-            echo "二次退出码：$?"
+              -clonedSourcePackagesDirPath "$(pwd)/../spm" 2>&1 | tail -80
           fi
+
+          if [ ! -d ../spm/checkouts/jellyfin-sdk-swift ]; then
+            echo "::error::jellyfin-sdk-swift 没有下载成功"
+            ls -la ../spm 2>/dev/null || true
+            exit 1
+          fi
+          echo "依赖就绪：$(ls ../spm/checkouts | wc -l) 个包"
 
       - name: 给 SDK 打 Emby 认证头补丁
         run: |
@@ -132,7 +139,7 @@ jobs:
             "$(pwd)/../spm/checkouts/jellyfin-sdk-swift" || true
 
           set -o pipefail
-          timeout 2700 xcodebuild \
+          xcodebuild \
             -project Swiftfin.xcodeproj \
             -scheme "${{ steps.scheme.outputs.name }}" \
             -configuration Release \
